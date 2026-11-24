@@ -1,0 +1,322 @@
+diff -ruN -x '*.orig' nvgpu/drivers/gpu/nvgpu/os/linux/driver_common.c ../../k/kernel/nvgpu/drivers/gpu/nvgpu/os/linux/driver_common.c
+--- a/nvgpu/drivers/gpu/nvgpu/os/linux/driver_common.c
++++ b/nvgpu/drivers/gpu/nvgpu/os/linux/driver_common.c
+@@ -275,7 +275,14 @@
+ 		 * suspend/resume and can lead to ACR failure on resume
+ 		 * as it expects GPU to be reset on every resume.
+ 		 */
+-		if (!of_property_read_bool(dev->of_node, "power-domains")) {
++		if (!of_property_read_bool(dev->of_node, "power-domains") &&
++		    /*
++		     * MALU-421: not on T210, where railgating is DVFS rail
++		     * power up/down (gm20b_tegra_railgate), not BPMP; R32's
++		     * GM20B node has no power-domains either.
++		     */
++		    !of_device_is_compatible(dev->of_node,
++					     "nvidia,tegra210-gm20b")) {
+ 			platform->can_railgate_init = false;
+ 		}
+ 
+diff -ruN -x '*.orig' nvgpu/drivers/gpu/nvgpu/os/linux/ioctl_as.c ../../k/kernel/nvgpu/drivers/gpu/nvgpu/os/linux/ioctl_as.c
+--- a/nvgpu/drivers/gpu/nvgpu/os/linux/ioctl_as.c
++++ b/nvgpu/drivers/gpu/nvgpu/os/linux/ioctl_as.c
+@@ -453,6 +453,22 @@
+ 	return gk20a_as_release_share(as_share);
+ }
+ 
++/*
++ * MALU-420: R32 (JetPack 4.6) userspace ABI. R32's ALLOC_SPACE (nr 6) takes a
++ * 24-byte struct with 32-bit pages, laid out exactly like R35's
++ * nvgpu32_as_alloc_space_args; R32's FREE_SPACE (nr 3) is 16 bytes with the
++ * offset (the only field the handler uses) first.
++ */
++struct nvgpu_as_free_space_args_r32 {
++	__u64 offset;
++	__u32 pages;
++	__u32 page_size;
++};
++#define NVGPU_AS_IOCTL_ALLOC_SPACE_R32 \
++	_IOWR(NVGPU_AS_IOCTL_MAGIC, 6, struct nvgpu32_as_alloc_space_args)
++#define NVGPU_AS_IOCTL_FREE_SPACE_R32 \
++	_IOWR(NVGPU_AS_IOCTL_MAGIC, 3, struct nvgpu_as_free_space_args_r32)
++
+ long gk20a_as_dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ {
+ 	int err = 0;
+@@ -490,6 +506,7 @@
+ 
+ 		break;
+ 	case NVGPU32_AS_IOCTL_ALLOC_SPACE:
++	case NVGPU_AS_IOCTL_ALLOC_SPACE_R32:
+ 	{
+ 		struct nvgpu32_as_alloc_space_args *args32 =
+ 			(struct nvgpu32_as_alloc_space_args *)buf;
+@@ -513,6 +530,19 @@
+ 		err = gk20a_as_ioctl_alloc_space(as_share,
+ 				(struct nvgpu_as_alloc_space_args *)buf);
+ 		break;
++	case NVGPU_AS_IOCTL_FREE_SPACE_R32:
++	{
++		struct nvgpu_as_free_space_args_r32 *old =
++			(struct nvgpu_as_free_space_args_r32 *)buf;
++		struct nvgpu_as_free_space_args args;
++
++		(void) memset(&args, 0, sizeof(args));
++		args.offset = old->offset;
++		args.pages = old->pages;
++		args.page_size = old->page_size;
++		err = gk20a_as_ioctl_free_space(as_share, &args);
++		break;
++	}
+ 	case NVGPU_AS_IOCTL_FREE_SPACE:
+ #ifdef CONFIG_NVGPU_TRACE
+ 		trace_gk20a_as_ioctl_free_space(g->name);
+diff -ruN -x '*.orig' nvgpu/drivers/gpu/nvgpu/os/linux/ioctl_ctrl.c ../../k/kernel/nvgpu/drivers/gpu/nvgpu/os/linux/ioctl_ctrl.c
+--- a/nvgpu/drivers/gpu/nvgpu/os/linux/ioctl_ctrl.c
++++ b/nvgpu/drivers/gpu/nvgpu/os/linux/ioctl_ctrl.c
+@@ -538,6 +538,37 @@
+ 	gpu.max_gpfifo_entries = rounddown_pow_of_two(U32_MAX /
+ 					nvgpu_get_gpfifo_entry_size());
+ 
++	/*
++	 * MALU-420/421: R32 (JetPack 4.6) userspace asks for its 256-byte
++	 * struct. R35 inserted emc_en_mask after fbp_en_mask (offset 124):
++	 * max_ltc_per_fbp .. chipname move by 4 (R35 128-159 = R32 124-155),
++	 * then the u64 gr_compbit_store_base_hw realigns to 160 in both, so
++	 * everything from 160 on has the same offset (checked field by field
++	 * with offsetof() on both headers, ~/scratch/jetson-r35/out/char-r3*.txt).
++	 */
++	if (request->gpu_characteristics_buf_size == 256U) {
++		u8 r32[256];
++
++		BUILD_BUG_ON(offsetof(struct nvgpu_gpu_characteristics,
++				      emc_en_mask) != 124);
++		BUILD_BUG_ON(offsetof(struct nvgpu_gpu_characteristics,
++				      chipname) != 152);
++		BUILD_BUG_ON(offsetof(struct nvgpu_gpu_characteristics,
++				      gr_compbit_store_base_hw) != 160);
++		BUILD_BUG_ON(sizeof(gpu) < 256);
++		memset(r32, 0, sizeof(r32));
++		memcpy(r32, &gpu, 124);
++		memcpy(r32 + 124, (u8 *)&gpu + 128, 32);
++		memcpy(r32 + 160, (u8 *)&gpu + 160, 96);
++		err = copy_to_user((void __user *)(uintptr_t)
++				   request->gpu_characteristics_buf_addr,
++				   r32, sizeof(r32));
++		if (err == 0)
++			request->gpu_characteristics_buf_size = sizeof(r32);
++		gk20a_idle(g);
++		return err;
++	}
++
+ 	if (request->gpu_characteristics_buf_size > 0) {
+ 		size_t write_size = sizeof(gpu);
+ 
+@@ -686,6 +717,49 @@
+ 	return err;
+ }
+ 
++/*
++ * MALU-420: R32 (JetPack 4.6) userspace ABI. R32's struct nvgpu_alloc_as_args
++ * is 16 bytes with no VA ranges; the kernel then laid the address space out
++ * itself. Rebuild R32's layout (common/as.c + vm.c in R32 nvgpu): big pages
++ * on, low hole = big_page_size << 10, user VA up to 2^37 - 2^32 (kernel VA
++ * on top), small/big split at nvgpu_gmmu_va_small_page_limit().
++ */
++struct nvgpu_alloc_as_args_r32 {
++	__u32 big_page_size;
++	__s32 as_fd;
++	__u32 flags;
++	__u32 reserved;
++};
++#define NVGPU_GPU_IOCTL_ALLOC_AS_R32 \
++	_IOWR(NVGPU_GPU_IOCTL_MAGIC, 8, struct nvgpu_alloc_as_args_r32)
++
++static int gk20a_ctrl_alloc_as_r32(struct gk20a *g,
++		struct nvgpu_alloc_as_args_r32 *old)
++{
++	struct nvgpu_alloc_as_args args;
++	u32 big = old->big_page_size;
++	int err;
++
++	if (big == 0U)
++		big = g->ops.mm.gmmu.get_default_big_page_size();
++
++	(void) memset(&args, 0, sizeof(args));
++	args.big_page_size = big;
++	args.flags = old->flags;
++	args.va_range_start = (u64)big << 10;
++	args.va_range_end = BIT64(37) - BIT64(32);
++	if (!nvgpu_is_enabled(g, NVGPU_MM_UNIFY_ADDRESS_SPACES) &&
++	    (old->flags & NVGPU_GPU_IOCTL_ALLOC_AS_FLAGS_UNIFIED_VA) == 0U)
++		args.va_range_split = nvgpu_gmmu_va_small_page_limit();
++
++	err = gk20a_ctrl_alloc_as(g, &args);
++	if (err == 0)
++		old->as_fd = args.as_fd;
++	nvgpu_log_info(g, "MALU-420 R32 alloc_as: big %u flags 0x%x -> %d",
++		       big, old->flags, err);
++	return err;
++}
++
+ static int gk20a_ctrl_open_tsg(struct gk20a *g, struct nvgpu_cdev *cdev,
+ 			       struct nvgpu_gpu_open_tsg_args *args)
+ {
+@@ -2429,6 +2503,10 @@
+ 		err = gk20a_ctrl_alloc_as(g,
+ 			(struct nvgpu_alloc_as_args *)buf);
+ 		break;
++	case NVGPU_GPU_IOCTL_ALLOC_AS_R32:
++		err = gk20a_ctrl_alloc_as_r32(g,
++			(struct nvgpu_alloc_as_args_r32 *)buf);
++		break;
+ 	case NVGPU_GPU_IOCTL_OPEN_TSG:
+ 		err = gk20a_ctrl_open_tsg(g, priv->cdev,
+ 			(struct nvgpu_gpu_open_tsg_args *)buf);
+diff -ruN -x '*.orig' nvgpu/drivers/gpu/nvgpu/os/linux/module.c ../../k/kernel/nvgpu/drivers/gpu/nvgpu/os/linux/module.c
+--- a/nvgpu/drivers/gpu/nvgpu/os/linux/module.c
++++ b/nvgpu/drivers/gpu/nvgpu/os/linux/module.c
+@@ -1984,6 +1984,19 @@
+ 	err = nvgpu_quiesce(g);
+ 	WARN(err, "gpu failed to idle during driver removal");
+ 
++	/*
++	 * MALU-421: the driver core runtime-resumes the GPU (ungating the rail) before .remove, and
++	 * gk20a_pm_deinit() disables runtime PM, so the suspend callback never gates it again: the
++	 * VDD_GPU enable leaked on every unload. Gate it here, after the poweroff, as
++	 * gk20a_pm_runtime_suspend() does.
++	 */
++	if (!err && !gk20a_gpu_is_virtual(dev)) {
++		int rg_err = gk20a_pm_railgate(dev);
++
++		if (rg_err)
++			nvgpu_err(g, "failed to railgate during removal, err=%d", rg_err);
++	}
++
+ 	if (nvgpu_mem_is_valid(&g->syncpt_mem))
+ 		nvgpu_dma_free(g, &g->syncpt_mem);
+ 
+diff -ruN -x '*.orig' nvgpu/drivers/gpu/nvgpu/os/linux/platform_gk20a_tegra.c ../../k/kernel/nvgpu/drivers/gpu/nvgpu/os/linux/platform_gk20a_tegra.c
+--- a/nvgpu/drivers/gpu/nvgpu/os/linux/platform_gk20a_tegra.c
++++ b/nvgpu/drivers/gpu/nvgpu/os/linux/platform_gk20a_tegra.c
+@@ -353,6 +353,44 @@
+ }
+ 
+ /*
++ * MALU-420: on 5.10 T210 the MC belongs to mainline's tegra-mc driver, so
++ * NVIDIA's tegra_mc_flush*() return early (no NVIDIA MC device). Also drive
++ * mainline's MC hot reset for the GPU client ("mc" reset in DT), or the GPU
++ * stays in the hot reset 4.9 left it in and can't reach memory.
++ */
++static struct reset_control *gm20b_mc_reset(struct device *dev)
++{
++	static struct reset_control *rst;
++
++	if (!rst) {
++		rst = reset_control_get_exclusive(dev, "mc");
++		if (IS_ERR(rst)) {
++			dev_err(dev, "MALU-420: no mc reset: %ld\n", PTR_ERR(rst));
++			rst = NULL;
++		}
++	}
++	return rst;
++}
++
++static void gm20b_mc_flush(struct device *dev)
++{
++	struct reset_control *rst = gm20b_mc_reset(dev);
++
++	tegra_mc_flush(MC_CLIENT_GPU);
++	if (rst)
++		reset_control_assert(rst);
++}
++
++static void gm20b_mc_flush_done(struct device *dev)
++{
++	struct reset_control *rst = gm20b_mc_reset(dev);
++
++	tegra_mc_flush_done(MC_CLIENT_GPU);
++	if (rst)
++		reset_control_deassert(rst);
++}
++
++/*
+  * gm20b_tegra_railgate()
+  *
+  * Gate (disable) gm20b power rail
+@@ -371,7 +409,7 @@
+ 		return 0;
+ #endif
+ 
+-	tegra_mc_flush(MC_CLIENT_GPU);
++	gm20b_mc_flush(dev);
+ 
+ 	udelay(10);
+ 
+@@ -499,11 +537,11 @@
+ 
+ #ifdef CONFIG_NV_TEGRA_MC
+ 	/* Flush MC after boot/railgate/SC7 */
+-	tegra_mc_flush(MC_CLIENT_GPU);
++	gm20b_mc_flush(dev);
+ 
+ 	udelay(10);
+ 
+-	tegra_mc_flush_done(MC_CLIENT_GPU);
++	gm20b_mc_flush_done(dev);
+ #endif
+ 
+ 	udelay(10);
+@@ -820,6 +858,10 @@
+ 	.round_rate = gm20b_round_rate_ops,
+ };
+ 
++/* MALU-421: kept so remove can unregister them (a reload failed with gpcclk still registered) */
++static struct clk *gm20b_gpcclk;
++static struct clk_lookup *gm20b_gpcclk_lookup;
++
+ static int gm20b_register_gpcclk(struct gk20a *g)
+ {
+ 	const char *parent_name = "pllg_ref";
+@@ -844,14 +886,20 @@
+ 
+ 	/* Data in .init is copied by clk_register(), so stack variable OK */
+ 	clk->hw.init = &init;
+-	c = clk_register(dev_from_gk20a(g), &clk->hw);
++	/*
++	 * MALU-420: no owning device. Since 4.15 the clock core runtime-resumes
++	 * a clock's device before preparing it; the GPU prepares gpcclk from
++	 * its own runtime resume, which then waits on itself forever.
++	 */
++	c = clk_register(NULL, &clk->hw);
+ 	if (IS_ERR(c)) {
+ 		nvgpu_err(g, "Failed to register GPCPLL clock");
+ 		return -EINVAL;
+ 	}
+ 
+ 	clk->g = g;
+-	clk_register_clkdev(c, "gpcclk", "gpcclk");
++	gm20b_gpcclk = c;
++	gm20b_gpcclk_lookup = clkdev_create(c, "gpcclk", "%s", "gpcclk");
+ 
+ 	return err;
+ }
+@@ -958,6 +1006,18 @@
+ 	/* deinitialise tegra specific scaling quirks */
+ 	gk20a_tegra_scale_exit(dev);
+ 
++#if defined(CONFIG_COMMON_CLK) && defined(CONFIG_TEGRA_DVFS)
++	/* MALU-421: undo gm20b_register_gpcclk() so the module can be reloaded */
++	if (gm20b_gpcclk_lookup) {
++		clkdev_drop(gm20b_gpcclk_lookup);
++		gm20b_gpcclk_lookup = NULL;
++	}
++	if (gm20b_gpcclk) {
++		clk_unregister(gm20b_gpcclk);
++		gm20b_gpcclk = NULL;
++	}
++#endif
++
+ #ifdef CONFIG_TEGRA_GK20A_NVHOST
+ 	nvgpu_free_nvhost_dev(get_gk20a(dev));
+ #endif

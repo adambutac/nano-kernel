@@ -1,0 +1,11 @@
+# Install once per clone: pre-commit install
+# pre-commit builds gitleaks on first run.
+#
+# Hook repos are pinned by full commit SHA, with the tag in a trailing comment: a tag can be
+# moved to other code, a SHA can't. Bump with `pre-commit autoupdate --freeze` and check each new
+# SHA is the tagged commit in the hook's own repository. Keep gitleaks at CI's GITLEAKS_VERSION.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e  # frozen: v8.30.1
+    hooks:
+      - id: gitleaks

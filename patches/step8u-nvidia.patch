@@ -1,0 +1,405 @@
+diff -ruN -x '*.orig' nvidia/drivers/clk/tegra/clk-cbus-shared.c ../../k/kernel/nvidia/drivers/clk/tegra/clk-cbus-shared.c
+--- a/nvidia/drivers/clk/tegra/clk-cbus-shared.c
++++ b/nvidia/drivers/clk/tegra/clk-cbus-shared.c
+@@ -11,9 +11,7 @@
+ #include <linux/clk-provider.h>
+ #include <linux/clk.h>
+ #include <linux/version.h>
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
+-#include <soc/tegra/tegra-dvfs.h>
+-#endif
++#include <soc/tegra/tegra-dvfs.h>	/* MALU-420: gbus prepare uses DVFS */
+ 
+ #include "clk.h"
+ 
+@@ -204,7 +202,7 @@
+ 	long new_rate;
+ 	unsigned long dvfs_rate;
+ 	struct tegra_clk_cbus_shared *cbus = to_clk_cbus_shared(hw);
+-	bool pass_through = cbus->flags & TEGRA_SHARED_BUS_ROUND_PASS_THRU;
++	bool __maybe_unused pass_through = cbus->flags & TEGRA_SHARED_BUS_ROUND_PASS_THRU;
+ 
+ 	parent = clk_get_parent(hw->clk);
+ 	if (IS_ERR_OR_NULL(parent)) {
+@@ -228,8 +226,15 @@
+ 	if (new_rate < 0)
+ 		return *parent_rate;
+ 
++	/*
++	 * MALU-421: the check is against the DVFS-rounded rate, which only exists on < 4.15 (above). On 5.10 dvfs_rate
++	 * is the request itself, so this caught gpcclk's 64 MHz minimum on the GPU's first power-on (gbus asks 12 MHz
++	 * before any user has a request); 64 MHz is inside gbus's lowest DVFS step (76.8 MHz at the 818 mV floor).
++	 */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
+ 	if (!pass_through)
+ 		WARN_ON(new_rate > dvfs_rate);
++#endif
+ 
+ 	return new_rate;
+ }
+@@ -563,12 +568,12 @@
+ 
+ static int clk_gbus_prepare(struct clk_hw *hw)
+ {
+-	/* FIXME Drop this check once dvfs feature is added to K59 */
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
+-	return tegra_dvfs_set_rate(hw->clk, clk_get_rate(hw->clk));
+-#else
+-	return -ENOTSUPP;
+-#endif
++	/*
++	 * MALU-420: T210 DVFS runs on this kernel, so do what 4.9 did: set the
++	 * GPU rail for the current gbus rate before the GPU clock runs (rate
++	 * changes go through DVFS's clock notifier).
++	 */
++	return tegra_dvfs_set_rate(hw->clk, clk_hw_get_rate(hw));
+ }
+ 
+ static void clk_gbus_unprepare(struct clk_hw *hw)
+diff -ruN -x '*.orig' nvidia/drivers/net/ethernet/realtek/r8168/r8168_n.c ../../k/kernel/nvidia/drivers/net/ethernet/realtek/r8168/r8168_n.c
+--- a/nvidia/drivers/net/ethernet/realtek/r8168/r8168_n.c
++++ b/nvidia/drivers/net/ethernet/realtek/r8168/r8168_n.c
+@@ -43,6 +43,7 @@
+ #include <linux/module.h>
+ #include <linux/version.h>
+ #include <linux/pci.h>
++#include <linux/of_net.h>	/* MALU-420: of_get_mac_address */
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
+ #include <linux/delay.h>
+@@ -26808,6 +26809,17 @@
+                 }
+         }
+ 
++        /* MALU-420: like mainline r8169, take the MAC from the device tree (local-mac-address, which the
++         * bootloader fills in on the Jetson Nano) when the chip has none. */
++        if (!is_valid_ether_addr(mac_addr) && tp->pci_dev->dev.of_node) {
++                const void *of_mac = of_get_mac_address(tp->pci_dev->dev.of_node);
++
++                if (!IS_ERR_OR_NULL(of_mac) && is_valid_ether_addr(of_mac)) {
++                        memcpy(mac_addr, of_mac, ETH_ALEN);
++                        netif_info(tp, probe, dev, "MAC %pM from device tree\n", mac_addr);
++                }
++        }
++
+         if (!is_valid_ether_addr(mac_addr)) {
+                 netif_err(tp, probe, dev, "Invalid ether addr %pM\n",
+                           mac_addr);
+diff -ruN -x '*.orig' nvidia/drivers/platform/tegra/mc/latency_allowance.c ../../k/kernel/nvidia/drivers/platform/tegra/mc/latency_allowance.c
+--- a/nvidia/drivers/platform/tegra/mc/latency_allowance.c
++++ b/nvidia/drivers/platform/tegra/mc/latency_allowance.c
+@@ -372,6 +372,8 @@
+ 
+ static int tegra_la_suspend(void)
+ {
++	if (!mc)	/* MALU-421: see tegra_latency_allowance_init() */
++		return 0;
+ 	if (cs.suspend)
+ 		return cs.suspend();
+ 	return 0;
+@@ -381,6 +383,9 @@
+ {
+ 	int i;
+ 
++	if (!mc)	/* MALU-421: see tegra_latency_allowance_init() */
++		return;
++
+ 	if (cs.resume) {
+ 		cs.resume();
+ 		return;
+@@ -410,6 +415,16 @@
+ 	unsigned int i;
+ 	int ret = 0;
+ 
++	/*
++	 * MALU-421: on T210 with this 5.10 tree the MC is driven by mainline tegra-mc (drivers/memory/tegra), which
++	 * programs the LA defaults itself; NVIDIA's mc.c no longer matches T210, so its register base stays NULL and every
++	 * program_la() access below would WARN ("Read/Write before MC init'ed") and be dropped.
++	 */
++	if (!mc) {
++		pr_info("la/ptsa: NVIDIA MC not initialised (mainline tegra-mc owns LA), skipping\n");
++		return 0;
++	}
++
+ 	init_chip_specific();
+ 
+ 	for (i = 0; i < cs.la_info_array_size; i++)
+diff -ruN -x '*.orig' nvidia/drivers/soc/tegra/tegra210-dvfs.c ../../k/kernel/nvidia/drivers/soc/tegra/tegra210-dvfs.c
+--- a/nvidia/drivers/soc/tegra/tegra210-dvfs.c
++++ b/nvidia/drivers/soc/tegra/tegra210-dvfs.c
+@@ -1546,10 +1546,14 @@
+ 	return ret;
+ }
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0)
++/* MALU-421: provided by the mainline tegra210-emc driver (patched) */
++bool tegra210_emc_is_ready(void);
++unsigned long tegra210_predict_emc_rate(int millivolts);
++#endif
++
+ static void adjust_emc_dvfs_from_timing_table(struct dvfs *d)
+ {
+-	/* FIXME EMC part is not enabled yet on K5.9 */
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
+ 	unsigned long rate;
+ 	int i;
+ 
+@@ -1564,7 +1568,6 @@
+ 		if (rate)
+ 			d->freqs[i] = rate;
+ 	}
+-#endif
+ }
+ 
+ static unsigned long dvb_predict_rate(
+@@ -2058,6 +2061,38 @@
+ 	BUG_ON((i == table_size) || ret);
+ }
+ 
++/*
++ * MALU-421: the core table is built once, on DVFS's first probe attempt
++ * (~0.8 s), before the mainline tegra210-emc driver has probed (~4 s), so the
++ * EMC entry kept its placeholder row. Fill it in from the EMC tables once the
++ * rails (and so a later probe attempt) are there.
++ */
++static void adjust_emc_dvfs_late(int soc_speedo_id, int core_process_id)
++{
++	static bool done;
++	int i;
++
++	if (done)
++		return;
++	if (!tegra210_emc_is_ready()) {
++		pr_warn("tegra210_dvfs: EMC driver not ready, EMC kept at the static DVFS row\n");
++		return;
++	}
++	done = true;
++
++	for (i = 0; i < dvfs_data->core_vf_table_size; i++) {
++		struct dvfs *d = &dvfs_data->core_vf_table[i];
++
++		if (strcmp(d->clk_name, "emc") ||
++		    !match_dvfs_one(d->clk_name, d->speedo_id, d->process_id,
++				    soc_speedo_id, core_process_id))
++			continue;
++		adjust_emc_dvfs_from_timing_table(d);
++		pr_info("tegra210_dvfs: emc dvfs from EMC tables, max %lu kHz\n",
++			d->freqs[d->num_freqs - 1] / 1000);
++	}
++}
++
+ static void init_core_dvfs_table(int soc_speedo_id, int core_process_id)
+ {
+ 	int core_nominal_mv_index;
+@@ -2117,8 +2152,8 @@
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
+ 		if (!strcmp(d->clk_name, "emc") && tegra210_emc_is_ready()) {
+ #else
+-		/* FIXME EMC part is not enabled yet on K5.9 */
+-		if (!strcmp(d->clk_name, "emc") && false) {
++		/* MALU-421: EMC freqs from the mainline tegra210-emc tables */
++		if (!strcmp(d->clk_name, "emc") && tegra210_emc_is_ready()) {
+ #endif
+ 			struct dvb_dvfs *dvbd = get_emc_dvb_dvfs(soc_speedo_id);
+ 
+@@ -2255,6 +2290,49 @@
+ 	}
+ }
+ 
++/*
++ * MALU-420 guard, per chip: the core and GPU nominals that R32 (4.9) computes
++ * for each Nano we run, keyed by the fuse values they are derived from. 5.10
++ * uses R32's core/GPU tables and selection code unchanged, so a mismatch
++ * means something else changed; a chip not listed here is refused as well.
++ *  - node8: R32 measured (r32-dvfs-table.txt): core 1125, gpu 1058.
++ *  - node7: on paper (dvfs/diagnosis.md): core 1075 = get_core_sku_max_mv()
++ *    for SoC process 1; gpu 1048 = GPU CVB at 921.6 MHz, -25 C range, for
++ *    GPU speedo value 2117.
++ */
++struct malu420_r32_nominal {
++	int soc_speedo_id;
++	int soc_process_id;
++	int gpu_speedo_id;
++	int gpu_speedo_value;
++	int core_mv;
++	int gpu_mv;
++};
++
++static const struct malu420_r32_nominal malu420_r32_nominals[] = {
++	{ 0, 0, 2, 2060, 1125, 1058 },	/* node8 */
++	{ 0, 1, 2, 2117, 1075, 1048 },	/* node7 */
++};
++
++static bool malu420_nominals_match_r32(void)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(malu420_r32_nominals); i++) {
++		const struct malu420_r32_nominal *n = &malu420_r32_nominals[i];
++
++		if (n->soc_speedo_id != tegra_sku_info.soc_speedo_id ||
++		    n->soc_process_id != tegra_sku_info.soc_process_id ||
++		    n->gpu_speedo_id != tegra_sku_info.gpu_speedo_id ||
++		    n->gpu_speedo_value != tegra_sku_info.gpu_speedo_value)
++			continue;
++
++		return vdd_core_rail.nominal_millivolts == n->core_mv &&
++		       vdd_gpu_rail.nominal_millivolts == n->gpu_mv;
++	}
++	return false;
++}
++
+ static int tegra210x_init_dvfs(struct device *dev, bool cpu_lp_init)
+ {
+ 	int soc_speedo_id = tegra_sku_info.soc_speedo_id;
+@@ -2265,20 +2343,35 @@
+ 	int cpu_lp_max_freq_index = 0;
+ 	int gpu_max_freq_index = 0;
+ 	struct device_node *node = dev->of_node;
++	/*
++	 * MALU-420: without the DFLL driver, leave the CPU rail out of DVFS
++	 * altogether (no regulator, no tables, no voltage changes). It is
++	 * index 0, so the managed rails are the rest of the array.
++	 */
++	bool cpu_unmanaged = of_property_read_bool(node,
++					"nvidia,cpu-rail-unmanaged");
++	struct dvfs_rail **rails = vdd_dvfs_rails;
++	int rails_num = dvfs_data->rails_num;
++
++	BUILD_BUG_ON(VDD_CPU_INDEX != 0);
++	if (cpu_unmanaged) {
++		rails = &vdd_dvfs_rails[VDD_CORE_INDEX];
++		rails_num--;
++	}
+ 
+-	tegra_dvfs_init_rails_lists(vdd_dvfs_rails, dvfs_data->rails_num);
++	tegra_dvfs_init_rails_lists(rails, rails_num);
+ 	init_core_dvfs_table(soc_speedo_id, core_process_id);
+ 
+ 	/* Get rails alignment, defer probe if regulators are not ready */
+-	for (i = 0; i <  dvfs_data->rails_num; i++) {
++	for (i = 0; i <  rails_num; i++) {
+ 		struct regulator *reg;
+ 		unsigned int step_uv;
+ 		int min_uV, max_uV, ret;
+ 
+-		reg = regulator_get(dev, vdd_dvfs_rails[i]->reg_id);
++		reg = regulator_get(dev, rails[i]->reg_id);
+ 		if (IS_ERR(reg)) {
+ 			pr_info("tegra_dvfs: Unable to get %s rail for step info, defering probe\n",
+-					vdd_dvfs_rails[i]->reg_id);
++					rails[i]->reg_id);
+ 			return -EPROBE_DEFER;
+ 		}
+ 
+@@ -2291,11 +2384,11 @@
+ 		if (ret || (!min_uV && !max_uV))
+ 		{
+ 			pr_info("tegra_dvfs: Unable to get rail constraints of %s rail, defering probe\n",
+-				vdd_dvfs_rails[i]->reg_id);
++				rails[i]->reg_id);
+ 			return -EPROBE_DEFER;
+ 		}
+ 
+-		vdd_dvfs_rails[i]->alignment.offset_uv = min_uV;
++		rails[i]->alignment.offset_uv = min_uV;
+ #endif
+ 
+ 		step_uv = regulator_get_linear_step(reg); /* 1st try get step */
+@@ -2306,8 +2399,8 @@
+ 				step_uv = (max_uV - min_uV) / (n_voltages - 1);
+ 		}
+ 		if (step_uv) {
+-			vdd_dvfs_rails[i]->alignment.step_uv = step_uv;
+-			vdd_dvfs_rails[i]->stats.bin_uv = step_uv;
++			rails[i]->alignment.step_uv = step_uv;
++			rails[i]->stats.bin_uv = step_uv;
+ 		}
+ 		regulator_put(reg);
+ 	}
+@@ -2317,6 +2410,11 @@
+ 	 * frequency, minimum  and nominal voltage for each CPU cluster, and
+ 	 * combined rail limits (fast CPU should be initialized 1st).
+ 	 */
++	adjust_emc_dvfs_late(soc_speedo_id, core_process_id);
++
++	if (cpu_unmanaged)
++		goto skip_cpu_tables;
++
+ 	ret = init_cpu_dvfs_table(dvfs_data->cpu_fv_table,
+ 		dvfs_data->cpu_fv_table_size, &cpu_max_freq_index);
+ 	if (ret)
+@@ -2328,6 +2426,7 @@
+ 			goto out;
+ 	}
+ 
++skip_cpu_tables:
+ 	/*
+ 	 * Construct GPU DVFS table from CVB data; find GPU maximum frequency,
+ 	 * and nominal voltage.
+@@ -2342,7 +2441,7 @@
+ 	tegra_dvfs_core_init_therm_limits(&vdd_core_rail);
+ 
+ 	/* Init rail structures and dependencies */
+-	tegra_dvfs_init_rails(vdd_dvfs_rails, dvfs_data->rails_num);
++	tegra_dvfs_init_rails(rails, rails_num);
+ 
+ 	if (of_property_read_bool(of_chosen, "nvidia,tegra-joint_xpu_rail"))
+ 		vdd_dvfs_rails[VDD_GPU_INDEX]->joint_rail_with_dfll = true;
+@@ -2351,20 +2450,37 @@
+ 	 * Initialize matching cpu dvfs entry already found when nominal
+ 	 * voltage was determined
+ 	 */
+-	init_dvfs_one(&cpu_dvfs, cpu_max_freq_index);
+-	if (cpu_lp_init)
+-		init_dvfs_one(&cpu_lp_dvfs, cpu_lp_max_freq_index);
++	if (!cpu_unmanaged) {
++		init_dvfs_one(&cpu_dvfs, cpu_max_freq_index);
++		if (cpu_lp_init)
++			init_dvfs_one(&cpu_lp_dvfs, cpu_lp_max_freq_index);
++	}
+ 	init_dvfs_one(&gpu_dvfs, gpu_max_freq_index);
+ 
+ 	disable_rail_scaling(node);
+ 
+-	for (i = 0; i < dvfs_data->rails_num; i++) {
+-		struct dvfs_rail *rail = vdd_dvfs_rails[i];
++	for (i = 0; i < rails_num; i++) {
++		struct dvfs_rail *rail = rails[i];
+ 		pr_info("tegra dvfs: %s: nominal %dmV, offset %duV, step %duV, scaling %s\n",
+ 			rail->reg_id, rail->nominal_millivolts,
+ 			rail->alignment.offset_uv, rail->alignment.step_uv,
+ 			rail->disabled ? "disabled" : "enabled");
+ 	}
++
++	/*
++	 * MALU-420 guard: refuse to touch any regulator unless 5.10's nominals
++	 * are the ones R32 (4.9) computes for this chip (see above).
++	 */
++	if (cpu_unmanaged && !malu420_nominals_match_r32()) {
++		pr_err("tegra dvfs: MALU-420 guard: nominals core %dmV gpu %dmV differ from R32 (SoC speedo %d process %d, GPU speedo %d value %d), not starting\n",
++		       vdd_core_rail.nominal_millivolts,
++		       vdd_gpu_rail.nominal_millivolts,
++		       tegra_sku_info.soc_speedo_id,
++		       tegra_sku_info.soc_process_id,
++		       tegra_sku_info.gpu_speedo_id,
++		       tegra_sku_info.gpu_speedo_value);
++		return -EINVAL;
++	}
+ 	return 0;
+ out:
+ 	return ret;
+diff -ruN -x '*.orig' nvidia/drivers/video/tegra/nvmap/nvmap_init.c ../../k/kernel/nvidia/drivers/video/tegra/nvmap/nvmap_init.c
+--- a/nvidia/drivers/video/tegra/nvmap/nvmap_init.c
++++ b/nvidia/drivers/video/tegra/nvmap/nvmap_init.c
+@@ -935,7 +935,9 @@
+ 		goto fail;
+ 
+ #ifdef NVMAP_LOADABLE_MODULE
+-	if (!(of_machine_is_compatible("nvidia,tegra186") ||
++	/* MALU-420: also T210 (Jetson Nano) */
++	if (!(of_machine_is_compatible("nvidia,tegra210") ||
++	    of_machine_is_compatible("nvidia,tegra186") ||
+ 	    of_machine_is_compatible("nvidia,tegra194") ||
+ 	    of_machine_is_compatible("nvidia,tegra234") ||
+ 	    of_machine_is_compatible("nvidia,tegra239") ||

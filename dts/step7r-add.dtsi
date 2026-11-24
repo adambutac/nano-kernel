@@ -1,0 +1,23 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* MALU-421 USB host on 5.10, on top of step7q (in step7r, booted 2026-11-13). See docs/analyses/usb-host-5.10.md.
+ * (1) padctl interrupt: NVIDIA's R35 xhci-tegra.c:2882-2884 takes the padctl wake IRQ from the padctl node
+ *     (of_irq_get(padctl, 0)) and fails the probe with -EINVAL when the node has no "interrupts" (mainline 5.10's
+ *     tegra210.dtsi has none). T210's padctl IRQ is SPI 49, level-high: R32 lists it as the xusb node's third
+ *     interrupt (<0 49 0x04>, tegra210-soc-base.dtsi) and node7 on 4.9 had "LIC 49 Level 70090000.xusb".
+ *     Interrupt parent is the root's (0x01, the LIC, #interrupt-cells 3), same as usb@70090000's <0x00 0x27 0x04>.
+ * (2) hub power: VDD_HUB_3V3 (0x33, GPIO A6 active-high) is only referenced by usb3-0's vbus-supply, which NVIDIA's
+ *     5.10 padctl driver never reads (usb3 ports have no supply), so the regulator stays off and its GPIO is driven low
+ *     (fixed.c:207-210). R32's plugin manager puts the same GPIO-A6 rail on usb2-1 for carriers 3449-0000-100/-200
+ *     (tegra210-porg-plugin-manager.dtsi fragment@5); tegra210_usb2_phy_init enables a host port's vbus supply.
+ */
+/ {
+	padctl@7009f000 {
+		interrupts = <0x00 0x31 0x04>;	/* SPI 49, IRQ_TYPE_LEVEL_HIGH */
+
+		ports {
+			usb2-1 {
+				vbus-supply = <0x33>;	/* VDD_HUB_3V3 (regulator@4, GPIO A6) */
+			};
+		};
+	};
+};

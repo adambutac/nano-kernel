@@ -1,0 +1,13 @@
+# Secrets and local state: never committed (AGENTS.md, Safety).
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite
+
+# Tooling
+.venv/
+__pycache__/
+.coverage
+.claude/settings.local.json
+.claude/worktrees/

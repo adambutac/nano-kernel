@@ -1,0 +1,515 @@
+diff -ruN -x '*.orig' kernel-5.10/drivers/clk/tegra/clk-tegra124-dfll-fcpu.c ../../k/kernel/kernel-5.10/drivers/clk/tegra/clk-tegra124-dfll-fcpu.c
+--- a/kernel-5.10/drivers/clk/tegra/clk-tegra124-dfll-fcpu.c
++++ b/kernel-5.10/drivers/clk/tegra/clk-tegra124-dfll-fcpu.c
+@@ -14,6 +14,7 @@
+ #include <linux/init.h>
+ #include <linux/of_device.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_opp.h>
+ #include <linux/regulator/consumer.h>
+ #include <soc/tegra/fuse.h>
+ 
+@@ -835,6 +836,37 @@
+ 		return PTR_ERR(soc->cvb);
+ 	}
+ 
++	/*
++	 * MALU-421 guard: R32 (4.9) on node8 runs this chip's CPU at up to
++	 * 1479 MHz with the DFLL capped at 1092 mV. Log the table and refuse to
++	 * register the DFLL (so it never drives the CPU rail) if any entry is
++	 * above either.
++	 */
++	{
++		unsigned long rate, bad = 0;
++		struct dev_pm_opp *opp;
++
++		for (rate = 0; ; rate++) {
++			unsigned long uv;
++
++			opp = dev_pm_opp_find_freq_ceil(soc->dev, &rate);
++			if (IS_ERR(opp))
++				break;
++			uv = dev_pm_opp_get_voltage(opp);
++			dev_pm_opp_put(opp);
++			dev_info(&pdev->dev, "MALU-421 opp %lu kHz %lu uV\n",
++				 rate / 1000, uv);
++			if (rate > 1479000000UL || uv > 1092000UL)
++				bad++;
++		}
++		if (bad) {
++			dev_err(&pdev->dev, "MALU-421 guard: %lu OPPs above 1479 MHz / 1092 mV, not registering the DFLL\n",
++				bad);
++			tegra_cvb_remove_opp_table(soc->dev, soc->cvb, soc->max_freq);
++			return -EINVAL;
++		}
++	}
++
+ 	INIT_TUNE_PRAM(tune0_low);
+ 	INIT_TUNE_PRAM(tune0_high);
+ 	INIT_TUNE_PRAM(tune1_low);
+diff -ruN -x '*.orig' kernel-5.10/drivers/devfreq/tegra30-devfreq.c ../../k/kernel/kernel-5.10/drivers/devfreq/tegra30-devfreq.c
+--- a/kernel-5.10/drivers/devfreq/tegra30-devfreq.c
++++ b/kernel-5.10/drivers/devfreq/tegra30-devfreq.c
+@@ -924,6 +924,9 @@
+ static const struct of_device_id tegra_devfreq_of_match[] = {
+ 	{ .compatible = "nvidia,tegra30-actmon" },
+ 	{ .compatible = "nvidia,tegra124-actmon" },
++	/* MALU-421: T210 ACTMON as T124 (R32's tegra210-cactmon: same base, MC_ALL at 0x1c0 irq bit 26,
++	 * same boost coefficients and thresholds, count weight 0x400) */
++	{ .compatible = "nvidia,tegra210-actmon" },
+ 	{ },
+ };
+ 
+diff -ruN -x '*.orig' kernel-5.10/drivers/i2c/busses/i2c-tegra.c ../../k/kernel/kernel-5.10/drivers/i2c/busses/i2c-tegra.c
+--- a/kernel-5.10/drivers/i2c/busses/i2c-tegra.c
++++ b/kernel-5.10/drivers/i2c/busses/i2c-tegra.c
+@@ -346,6 +346,7 @@
+ 	bool msg_read;
+ 	bool is_dvc;
+ 	bool is_vi;
++	bool in_rpm_resume;	/* MALU-421: tegra_i2c_init() called from our own runtime resume */
+ 	bool reinit_ctrl_before_xfer;
+ };
+ 
+@@ -875,7 +876,14 @@
+ 	u32 val;
+ 	int err;
+ 
+-	if (!pm_runtime_enabled(i2c_dev->dev)) {
++	/*
++	 * MALU-421: the VI I2C runtime resume re-inits the controller through this function; taking a
++	 * runtime PM reference here then waits for that same resume to finish, forever (Nano boot hung
++	 * in tegra_i2c_probe). The caller already has the clocks on, so skip the get/put.
++	 */
++	if (i2c_dev->in_rpm_resume) {
++		/* clocks and power already on */
++	} else if (!pm_runtime_enabled(i2c_dev->dev)) {
+ 		err = tegra_i2c_runtime_resume(i2c_dev->dev);
+ 		if (err < 0) {
+ 			dev_err(i2c_dev->dev, "runtime resume fail =%d\n", err);
+@@ -961,7 +969,9 @@
+ 		goto exit;
+ 
+ exit:
+-	if (!pm_runtime_enabled(i2c_dev->dev))
++	if (i2c_dev->in_rpm_resume)
++		;	/* MALU-421: nothing taken above */
++	else if (!pm_runtime_enabled(i2c_dev->dev))
+ 		tegra_i2c_runtime_suspend(i2c_dev->dev);
+ 	else
+ 		pm_runtime_put(i2c_dev->dev);
+@@ -2374,7 +2384,9 @@
+ 	 * controller needs to be re-initialized after power ON.
+ 	 */
+ 	if (i2c_dev->is_vi) {
++		i2c_dev->in_rpm_resume = true;
+ 		err = tegra_i2c_init(i2c_dev);
++		i2c_dev->in_rpm_resume = false;
+ 		if (err)
+ 			goto disable_clocks;
+ 	}
+diff -ruN -x '*.orig' kernel-5.10/drivers/iommu/iommu.c ../../k/kernel/kernel-5.10/drivers/iommu/iommu.c
+--- a/kernel-5.10/drivers/iommu/iommu.c
++++ b/kernel-5.10/drivers/iommu/iommu.c
+@@ -2447,8 +2447,11 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	iommu_iotlb_gather_init(iotlb_gather);
+-
++	/*
++	 * MALU-421: the caller initialises the gather. __iommu_map_sg() calls this once per physically contiguous
++	 * segment with one gather and syncs once at the end; initialising it here threw away the earlier segments'
++	 * pending range, so only the last segment of a scatterlist was ever flushed (tegra-smmu: GPU faults).
++	 */
+ 	pr_debug("map: iova 0x%lx pa %pa size 0x%zx\n", iova, &paddr, size);
+ 
+ 	while (size) {
+@@ -2485,6 +2488,7 @@
+ 	struct iommu_iotlb_gather iotlb_gather;
+ 	int ret;
+ 
++	iommu_iotlb_gather_init(&iotlb_gather);
+ 	ret = __iommu_map(domain, iova, paddr, size, prot, gfp, &iotlb_gather);
+ 	if (ret == 0 && ops->iotlb_sync_map)
+ 		ops->iotlb_sync_map(domain, &iotlb_gather);
+@@ -2607,6 +2611,7 @@
+ 	unsigned int i = 0;
+ 	int ret;
+ 
++	iommu_iotlb_gather_init(&iotlb_gather);
+ 	while (i <= nents) {
+ 		phys_addr_t s_phys = sg_phys(sg);
+ 
+diff -ruN -x '*.orig' kernel-5.10/drivers/iommu/tegra-smmu.c ../../k/kernel/kernel-5.10/drivers/iommu/tegra-smmu.c
+--- a/kernel-5.10/drivers/iommu/tegra-smmu.c
++++ b/kernel-5.10/drivers/iommu/tegra-smmu.c
+@@ -939,13 +939,23 @@
+ static void tegra_smmu_iotlb_sync(struct iommu_domain *domain,
+ 				  struct iommu_iotlb_gather *gather)
+ {
+-	unsigned long start = gather->start, size = gather->end - gather->start;
++	/*
++	 * MALU-421: gather->end is inclusive (iommu_iotlb_gather_add_page() sets it to iova + size - 1), so the range
++	 * is end - start + 1 bytes. Without the + 1 the last page of every map/unmap was never written back or flushed
++	 * from the PTC/TLB: a single-page map stayed invisible to the SMMU (GPU faults), a single-page unmap stayed live.
++	 */
++	unsigned long start = gather->start, size;
+ 	struct tegra_smmu_as *as = to_smmu_as(domain);
+ 	struct tegra_smmu *smmu = as->smmu;
+-	unsigned int total = size >> SMMU_PTE_SHIFT;
++	unsigned int total;
+ 	unsigned long flags;
+ 	unsigned int len;
+ 
++	if (gather->end < gather->start)
++		return;
++	size = gather->end - gather->start + 1;
++	total = size >> SMMU_PTE_SHIFT;
++
+ 	spin_lock_irqsave(&as->lock, flags);
+ 
+ 	for (; total; total -= len) {
+@@ -967,20 +977,26 @@
+ 			len = SMMU_NUM_PTE - pt_index;
+ 
+ 		pte = tegra_smmu_pte_lookup(as, iova, &pte_dma);
+-		if (!pte)
++		if (!pte) {
++			/* MALU-421: no page table here; skip its pages instead of retrying the same IOVA */
++			start += (unsigned long)len << SMMU_PTE_SHIFT;
+ 			continue;
++		}
+ 
+ 		offset = SMMU_OFFSET_IN_PAGE(pte);
+ 		dma_sync_single_range_for_device(smmu->dev, pte_dma, offset,
+ 						 sizeof(*pte) * len, DMA_TO_DEVICE);
+ 
+-		/* Calculate ptcs to flush as each PTC flush covers all PTEs in one atom wide */
+-		num_ptcs = ALIGN(len, ptes_per_ptc) / ptes_per_ptc;
++		/*
++		 * Each PTC flush covers one atom of PTEs, each TLB flush one TLB line. MALU-421: count from the first to
++		 * the last atom/line the range touches; ALIGN(len, n) / n misses the last one when the range does not
++		 * start on a boundary. smmu_flush_ptc() masks the offset to the atom, the TLB flush matches VA[31:15].
++		 */
++		num_ptcs = (pt_index + len - 1) / ptes_per_ptc - pt_index / ptes_per_ptc + 1;
+ 		for (i = 0; i < num_ptcs; i++)
+ 			smmu_flush_ptc(smmu, pte_dma, offset + i * atom_size);
+ 
+-		/* Calculate tlbs to flush as each TLB flush covers all PTEs in one TLB line */
+-		num_tlbs = ALIGN(len, ptes_per_tlb) / ptes_per_tlb;
++		num_tlbs = (pt_index + len - 1) / ptes_per_tlb - pt_index / ptes_per_tlb + 1;
+ 		for (i = 0; i < num_tlbs; i++)
+ 			smmu_flush_tlb_group(smmu, as->id, iova + i * size_per_tlb);
+ 
+diff -ruN -x '*.orig' kernel-5.10/drivers/memory/tegra/tegra210-emc-core.c ../../k/kernel/kernel-5.10/drivers/memory/tegra/tegra210-emc-core.c
+--- a/kernel-5.10/drivers/memory/tegra/tegra210-emc-core.c
++++ b/kernel-5.10/drivers/memory/tegra/tegra210-emc-core.c
+@@ -1824,6 +1824,39 @@
+ 	return 0;
+ }
+ 
++/*
++ * MALU-421: R32's tegra210_predict_emc_rate() for NVIDIA's T210 DVFS, from
++ * this driver's nominal table: the highest rate whose min_volt fits under
++ * the given core voltage. NVIDIA's 5.10 DVFS stubbed this out ("FIXME EMC
++ * part is not enabled yet on K5.9") and capped EMC at a placeholder 1.2 GHz.
++ */
++static struct tegra210_emc *tegra210_emc_for_dvfs;
++
++bool tegra210_emc_is_ready(void)
++{
++	return READ_ONCE(tegra210_emc_for_dvfs) != NULL;
++}
++EXPORT_SYMBOL(tegra210_emc_is_ready);
++
++unsigned long tegra210_predict_emc_rate(int millivolts)
++{
++	struct tegra210_emc *emc = READ_ONCE(tegra210_emc_for_dvfs);
++	unsigned long rate = 0;
++	unsigned int i;
++
++	if (!emc || !emc->nominal || !emc->num_timings)
++		return -EINVAL;
++
++	for (i = 0; i < emc->num_timings; i++) {
++		if (emc->nominal[i].min_volt > millivolts)
++			break;
++		rate = emc->nominal[i].rate * 1000UL;
++	}
++
++	return rate;
++}
++EXPORT_SYMBOL(tegra210_predict_emc_rate);
++
+ static int tegra210_emc_probe(struct platform_device *pdev)
+ {
+ 	struct thermal_cooling_device *cd;
+@@ -2008,6 +2041,7 @@
+ 		goto detach;
+ 	}
+ 
++	WRITE_ONCE(tegra210_emc_for_dvfs, emc);
+ 	return 0;
+ 
+ detach:
+diff -ruN -x '*.orig' kernel-5.10/drivers/memory/tegra/tegra210.c ../../k/kernel/kernel-5.10/drivers/memory/tegra/tegra210.c
+--- a/kernel-5.10/drivers/memory/tegra/tegra210.c
++++ b/kernel-5.10/drivers/memory/tegra/tegra210.c
+@@ -108,7 +108,7 @@
+ 			.reg = 0x2e0,
+ 			.shift = 0,
+ 			.mask = 0xff,
+-			.def = 0x2e,
++			.def = 0x73,	/* MALU-421: R32 value (NVIDIA t21x LA init at the 204 MHz boot EMC, never rescaled); mainline 0x2e */
+ 		},
+ 	}, {
+ 		.id = 0x0f,
+@@ -286,7 +286,7 @@
+ 			.reg = 0x2e0,
+ 			.shift = 16,
+ 			.mask = 0xff,
+-			.def = 0x80,
++			.def = 0xff,	/* MALU-421: R32 value (NVIDIA t21x LA init at the 204 MHz boot EMC, never rescaled); mainline 0x80 */
+ 		},
+ 	}, {
+ 		.id = 0x32,
+@@ -788,7 +788,7 @@
+ 			.reg = 0x3c8,
+ 			.shift = 0,
+ 			.mask = 0xff,
+-			.def = 0x50,
++			.def = 0x1e,	/* MALU-421: R32 value (TRM reset value, as read on R32 on headless node8); mainline 0x50 */
+ 		},
+ 	}, {
+ 		.id = 0x78,
+diff -ruN -x '*.orig' kernel-5.10/drivers/mmc/host/sdhci-tegra.c ../../k/kernel/kernel-5.10/drivers/mmc/host/sdhci-tegra.c
+--- a/kernel-5.10/drivers/mmc/host/sdhci-tegra.c
++++ b/kernel-5.10/drivers/mmc/host/sdhci-tegra.c
+@@ -767,7 +767,8 @@
+ 	tegra_sdhci_set_tap(host, tegra_host->tuned_tap_delay);
+ 	tegra_host->tuning_status = TUNING_STATUS_DONE;
+ 
+-	pr_debug("%s: hw tuning done ...\n", mmc_hostname(host->mmc));
++	/* MALU-423: info as on R32, plus the tap (SD retune storm investigation) */
++	pr_info("%s: hw tuning done, tap %u\n", mmc_hostname(host->mmc), tegra_host->tuned_tap_delay);
+ 	tegra_sdhci_dump_vendor_regs(host);
+ }
+ 
+@@ -1795,7 +1796,7 @@
+ 	struct sdhci_tegra *tegra_host = sdhci_pltfm_priv(pltfm_host);
+ 
+ 	if (tegra_host->tuning_status == TUNING_STATUS_DONE) {
+-		dev_dbg(mmc_dev(host->mmc),
++		dev_info(mmc_dev(host->mmc),	/* MALU-423: info as on R32 */
+ 			"Tuning done, restoring the best tap value : %u\n",
+ 				tegra_host->tuned_tap_delay);
+ 		tegra_sdhci_set_tap(host, tegra_host->tuned_tap_delay);
+@@ -2575,7 +2576,28 @@
+ 	.use_bwmgr = false,
+ };
+ 
++/*
++ * MALU-423: TRM VENDOR_TUNING_CNTRL0 bit 27 (set by the prod settings, as on R32): the controller raises a
++ * re-tuning request on CMD/data CRC errors in SDR50/SDR104/HS200 "to initiate re-tuning by software to
++ * compensate for temperature drift". Restoring the saved tap (tegra_sdhci_skip_retuning) doesn't do that,
++ * so a Re-Tuning Event makes the next execute_tuning run hardware tuning. Returns intmask unchanged.
++ */
++static u32 tegra210_sdhci_irq(struct sdhci_host *host, u32 intmask)
++{
++	if (intmask & SDHCI_INT_RETUNE) {
++		struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
++		struct sdhci_tegra *tegra_host = sdhci_pltfm_priv(pltfm_host);
++
++		tegra_host->tuning_status = TUNING_STATUS_RETUNE;
++	}
++	return intmask;
++}
++
+ static const struct sdhci_ops tegra210_sdhci_ops = {
++	.irq	    = tegra210_sdhci_irq,	/* MALU-423 */
++	/* MALU-421: as the other Tegra ops: up to 257 software loops and the prod's TUN_ITER (R32: 128 tries
++	 * for SDR104); the generic loop stops at 40 */
++	.get_max_tuning_loop_counter = tegra_sdhci_get_max_tuning_loop_counter,
+ 	.get_ro     = tegra_sdhci_get_ro,
+ 	.read_w     = tegra_sdhci_readw,
+ 	.write_w    = tegra210_sdhci_writew,
+@@ -2599,6 +2621,8 @@
+ 		  SDHCI_QUIRK_BROKEN_CARD_DETECTION |
+ 		  SDHCI_QUIRK_NO_ENDATTR_IN_NOPDESC |
+ 		  SDHCI_QUIRK_CAP_CLOCK_BASE_BROKEN,
++	/* MALU-421: DMA and 64-bit DMA back on (MALU-420's PIO and 32-bit DMA were kexec workarounds; cold boots
++	 * run 64-bit ADMA cleanly, bisect sd1/sd3) */
+ 	.quirks2 = SDHCI_QUIRK2_PRESET_VALUE_BROKEN |
+ 		   SDHCI_QUIRK2_ISSUE_CMD_DAT_RESET_TOGETHER |
+ 		   SDHCI_QUIRK2_SEL_SDR104_UHS_MODE_IN_SDR50 |
+@@ -2609,6 +2633,8 @@
+ static const struct sdhci_tegra_soc_data soc_data_tegra210 = {
+ 	.pdata = &sdhci_tegra210_pdata,
+ 	.dma_mask = DMA_BIT_MASK(34),
++	/* MALU-421: NVIDIA's full T210 set again. UHS needs the DT's prod-settings (R32's, DTB step7f) and the
++	 * long tuning loop below: without them SDR104 tuning never locked and the Nano froze (bisect sd4-sd4n). */
+ 	.nvquirks = NVQUIRK_NEEDS_PAD_CONTROL |
+ 		    NVQUIRK_HAS_PADCALIB |
+ 		    NVQUIRK_DIS_CARD_CLK_CONFIG_TAP |
+@@ -3218,7 +3244,13 @@
+ 				ret);
+ 	}
+ 
+-	tegra_host->tuning_status = TUNING_STATUS_RETUNE;
++	/*
++	 * MALU-423: no tuning_status = TUNING_STATUS_RETUNE here. R32 keeps the tuned tap across runtime PM
++	 * (its runtime resume only restores the clock); resetting it made every runtime resume (10 ms autosuspend)
++	 * run full hardware tuning: 144 tunings in ~100 s of dpkg I/O, taps 29-34 and 72-73, and write CRC errors
++	 * whose re-tuning requests ended in the mmc0 IRQ being disabled. The core still flags a retune after
++	 * runtime suspend; tegra_sdhci_skip_retuning() then restores the tuned tap, as on R32.
++	 */
+ 
+ 	return ret;
+ 
+diff -ruN -x '*.orig' kernel-5.10/drivers/mmc/host/sdhci.c ../../k/kernel/kernel-5.10/drivers/mmc/host/sdhci.c
+--- a/kernel-5.10/drivers/mmc/host/sdhci.c
++++ b/kernel-5.10/drivers/mmc/host/sdhci.c
+@@ -2763,6 +2763,10 @@
+ 
+ void sdhci_end_tuning(struct sdhci_host *host)
+ {
++	/* MALU-423: re-arm the Re-Tuning Event masked in sdhci_irq (modes 2/3, as sdhci_set_default_irqs) */
++	if (host->tuning_mode == SDHCI_TUNING_MODE_2 ||
++	    host->tuning_mode == SDHCI_TUNING_MODE_3)
++		host->ier |= SDHCI_INT_RETUNE;
+ 	sdhci_writel(host, host->ier, SDHCI_INT_ENABLE);
+ 	sdhci_writel(host, host->ier, SDHCI_SIGNAL_ENABLE);
+ }
+@@ -3703,8 +3707,27 @@
+ 			pr_err("%s: Card is consuming too much power!\n",
+ 				mmc_hostname(host->mmc));
+ 
+-		if (intmask & SDHCI_INT_RETUNE)
++		if (intmask & SDHCI_INT_RETUNE) {
++			/* MALU-423: debug count of Re-Tuning Events (rate-limited) */
++			static unsigned long malu_retune_irqs;
++
++			malu_retune_irqs++;
++			pr_warn_ratelimited("%s: re-tuning event (%lu so far) need %d hold %d doing %d now %d present 0x%08x\n",
++				mmc_hostname(host->mmc), malu_retune_irqs, host->mmc->need_retune,
++				host->mmc->hold_retune, host->mmc->doing_retune, host->mmc->retune_now,
++				sdhci_readl(host, SDHCI_PRESENT_STATE));
+ 			mmc_retune_needed(host->mmc);
++			/*
++			 * MALU-423: the Re-Tuning Event status can't be cleared by writing it (it is excluded below and
++			 * reflects the controller's Re-Tuning Request), and the core holds re-tuning off while requests
++			 * are pipelined (hold_retune 2 seen), so leaving it enabled made the level interrupt fire millions
++			 * of times on one CPU. need_retune now records the event; mask it until tuning has run
++			 * (sdhci_execute_tuning) or the host is reinitialised (sdhci_set_default_irqs on runtime resume).
++			 */
++			host->ier &= ~SDHCI_INT_RETUNE;
++			sdhci_writel(host, host->ier, SDHCI_INT_ENABLE);
++			sdhci_writel(host, host->ier, SDHCI_SIGNAL_ENABLE);
++		}
+ 
+ 		if ((intmask & SDHCI_INT_CARD_INT) &&
+ 		    (host->ier & SDHCI_INT_CARD_INT)) {
+diff -ruN -x '*.orig' kernel-5.10/drivers/phy/tegra/xusb-tegra210.c ../../k/kernel/kernel-5.10/drivers/phy/tegra/xusb-tegra210.c
+--- a/kernel-5.10/drivers/phy/tegra/xusb-tegra210.c
++++ b/kernel-5.10/drivers/phy/tegra/xusb-tegra210.c
+@@ -736,7 +736,7 @@
+ 	if (tegra210_plle_hw_sequence_is_enabled())
+ 		goto skip_pll_init;
+ 
+-	usb = tegra_xusb_lane_check(lane, "usb3-ss");
++	usb = tegra_xusb_lane_check(lane, "xusb");
+ 
+ 	err = clk_prepare_enable(sata->pll);
+ 	if (err < 0)
+@@ -2841,7 +2841,7 @@
+ 							tegra210_usb3_lane_map(lane));
+ 	}
+ 
+-	if (tegra_xusb_lane_check(lane, "usb3-ss"))
++	if (tegra_xusb_lane_check(lane, "xusb"))
+ 		err = tegra210_usb3_phy_power_on(phy);
+ 
+ 	mutex_unlock(&padctl->lock);
+@@ -2856,7 +2856,7 @@
+ 
+ 	mutex_lock(&padctl->lock);
+ 
+-	if (tegra_xusb_lane_check(lane, "usb3-ss"))
++	if (tegra_xusb_lane_check(lane, "xusb"))
+ 		err = tegra210_usb3_phy_power_off(phy);
+ 
+ 	mutex_unlock(&padctl->lock);
+@@ -3023,7 +3023,7 @@
+ 				tegra210_usb3_lane_map(lane));
+ 	}
+ 
+-	if (tegra_xusb_lane_check(lane, "usb3-ss"))
++	if (tegra_xusb_lane_check(lane, "xusb"))
+ 		err = tegra210_usb3_phy_power_on(phy);
+ 
+ 	mutex_unlock(&padctl->lock);
+@@ -3038,7 +3038,7 @@
+ 
+ 	mutex_lock(&padctl->lock);
+ 
+-	if (tegra_xusb_lane_check(lane, "usb3-ss"))
++	if (tegra_xusb_lane_check(lane, "xusb"))
+ 		err = tegra210_usb3_phy_power_off(phy);
+ 
+ 	mutex_unlock(&padctl->lock);
+diff -ruN -x '*.orig' kernel-5.10/drivers/soc/tegra/fuse/fuse-tegra30.c ../../k/kernel/kernel-5.10/drivers/soc/tegra/fuse/fuse-tegra30.c
+--- a/kernel-5.10/drivers/soc/tegra/fuse/fuse-tegra30.c
++++ b/kernel-5.10/drivers/soc/tegra/fuse/fuse-tegra30.c
+@@ -334,6 +334,11 @@
+ 		.con_id = "calibration",
+ 	}, {
+ 		.nvmem_name = "fuse",
++		.cell_name = "gcplex-config-fuse",
++		.dev_id = "57000000.gpu",
++		.con_id = "gcplex-config-fuse",
++	}, {
++		.nvmem_name = "fuse",
+ 		.cell_name = "xusb-pad-calibration-ext",
+ 		.dev_id = "7009f000.padctl",
+ 		.con_id = "calibration-ext",
+diff -ruN -x '*.orig' kernel-5.10/drivers/thermal/tegra/soctherm.c ../../k/kernel/kernel-5.10/drivers/thermal/tegra/soctherm.c
+--- a/kernel-5.10/drivers/thermal/tegra/soctherm.c
++++ b/kernel-5.10/drivers/thermal/tegra/soctherm.c
+@@ -745,8 +745,13 @@
+ 	r = REG_SET_MASK(r, THERMCTL_LVL0_CPU0_EN_MASK, 0);
+ 	writel(r, zone->ts->regs + zone->sg->thermctl_lvl0_offset);
+ 
+-	lo = enforce_temp_range(zone->dev, lo) / zone->ts->soc->thresh_grain;
+-	hi = enforce_temp_range(zone->dev, hi) / zone->ts->soc->thresh_grain;
++	/*
++	 * MALU-421: the thermal core passes -INT_MAX / INT_MAX for "no lower / upper trip" on every update, so on a
++	 * polled zone (pllx and AO-therm under pid_thermal_gov) enforce_temp_range() logged "trip temperature
++	 * -2147483647 forced to -127000" about twice a second. Clamp these silently; thermtrip/throttrip keep the message.
++	 */
++	lo = clamp_val(lo, min_low_temp, max_high_temp) / zone->ts->soc->thresh_grain;
++	hi = clamp_val(hi, min_low_temp, max_high_temp) / zone->ts->soc->thresh_grain;
+ 	dev_dbg(zone->dev, "%s hi:%d, lo:%d\n", __func__, hi, lo);
+ 
+ 	r = REG_SET_MASK(r, zone->sg->thermctl_lvl0_up_thresh_mask, hi);
+diff -ruN -x '*.orig' kernel-5.10/tools/bpf/resolve_btfids/main.c ../../k/kernel/kernel-5.10/tools/bpf/resolve_btfids/main.c
+--- a/kernel-5.10/tools/bpf/resolve_btfids/main.c
++++ b/kernel-5.10/tools/bpf/resolve_btfids/main.c
+@@ -531,8 +531,15 @@
+ 
+ 		id = btf_id__find(root, str);
+ 		if (id) {
+-			id->id = type_id;
+-			(*nr)--;
++			/* MALU-420: backport of upstream 5.11 "tools/resolve_btfids: Warn when having multiple IDs for
++			 * single type": count a symbol once, or duplicate types end the search early. */
++			if (id->id) {
++				pr_debug("WARN: multiple IDs found for '%s': %d, %d - using %d\n",
++					str, id->id, type_id, id->id);
++			} else {
++				id->id = type_id;
++				(*nr)--;
++			}
+ 		}
+ 	}
+ 

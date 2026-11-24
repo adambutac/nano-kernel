@@ -1,0 +1,15 @@
+cclk_g            204.0  306.0  408.0  510.0  612.0  714.0  816.0  918.0 1020.0 1122.0 1224.0 1326.0 1479.0
+
+vdd-cpu             861    861    861    861    861    861    868    912    962   1006   1062   1118
+cclk_lp            51.0  102.0  204.0  307.2  403.2  518.4  614.4  710.4  825.6  921.6 1036.8 1132.8
+===
+vmin_mv=900   vmax_mv=1092   tune_high_mv=0   output_mv=996   rate=1479000000   dvco_rate_min=1122000000   external_floor_mv=708   
+THERM CAPS:
+ 66C..  1092mV
+ 86C..  1072mV
+TUNE HIGH: NONE
+THERM FLOORS:
+ .. 15C  957mV  1300500kHz (calibrated)
+ ..125C  900mV  1122000kHz (calibrated)
+  vmin:  708mV   612000kHz
+DVCO_CALIBRATION_MAX: 1479000kHz

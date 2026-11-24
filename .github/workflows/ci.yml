@@ -1,0 +1,37 @@
+# Runs on every pull request and on pushes to main.
+#
+# Actions are pinned by full commit SHA, with the tag in a trailing comment: a tag can be moved
+# to other code by whoever controls the action's repository, a SHA can't. Dependabot
+# (.github/dependabot.yml) proposes the bumps.
+#
+# No test job: the repo holds kernel patches, a config, DT sources and docs; the patches are checked against NVIDIA's
+# sources on the build machine (README.md). gitleaks only.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secrets:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read   # gitleaks-action lists the PR's commits through the API
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # scan every commit in the PR, not just the tip
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_VERSION: "8.30.1"   # same as the pre-commit hook
